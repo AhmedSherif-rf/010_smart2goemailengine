@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+    tools {
+		maven 'maven'	   
+    }
+       environment {
+        // This can be nexus3 or nexus2
+        NEXUS_VERSION = "nexus3"
+        // This can be http or https
+        NEXUS_PROTOCOL = "http"
+        // Where your Nexus is running
+        NEXUS_URL = "192.168.3.163:8081"
+        // Repository where we will upload the artifact
+        NEXUS_REPOSITORY = "smart2go"  
+        // Jenkins credential id to authenticate to Nexus OSS
+        NEXUS_CREDENTIAL_ID = "nexus"
+		VERSION = "${env.BUILD_NUMBER}"
+        POM_VERSION = readMavenPom().getVersion() 
+        major = POM_VERSION.substring(0,POM_VERSION.indexOf("."))
+        minor = POM_VERSION.substring(POM_VERSION.indexOf(".") + 1).substring(0, POM_VERSION.indexOf("."))
+        major_minor = "$major.$minor"
+       }
+       
+
+    stages {
+    
+    	    stage('Build') {
+            
+            steps {
+                // Optionally use a Maven environment you've configured already
+                withMaven(){
+                     
+                     // increase build number.
+                     sh 'mvn build-helper:parse-version versions:set -DnewVersion=\\\${parsedVersion.majorVersion}.\\\${parsedVersion.minorVersion}.\\\${parsedVersion.nextIncrementalVersion} versions:commit'
+                    
+                     
+                    // Push the changes of POM file.
+                    withCredentials([usernamePassword(credentialsId: 'e538ccc4-c5c8-452a-a99b-dbbb5ec4050c', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]){    
+                        sh('''
+                            git commit -am "Updated Build Number by Jenkins"
+                            git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"
+                            git push origin HEAD:master
+                            git config --unset credential.helper
+                        ''')
+                    }
+                        
+					sh 'mvn clean install -X'
+                }
+            }
+        }
+       
+        
+//		stage('SonarQube analysis') {
+//            tools {
+//                jdk "java-11" // the name you have given the JDK installation using the JDK manager (Global Tool Configuration)
+//            }
+//            steps {
+//                withMaven(){
+//                    sh 'mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.6.0.1398:sonar -Dsonar.projectKey=smart2goemailengine -Dsonar.host.url=http://192.168.3.36:9001 -Dsonar.login=4a6fed97e3cf618e1ee003dc990c058fe870209b'
+//                }
+//            }
+//        }
+
+
+         stage('publish to nexus') {		 
+            steps {
+                script {
+                echo "UPLOAD_ON_NEXUS ${params.UPLOAD_ON_NEXUS}"
+                 if (params.UPLOAD_ON_NEXUS) {
+                    // Read POM xml file using 'readMavenPom' step , this step 'readMavenPom' is included in: https://plugins.jenkins.io/pipeline-utility-steps
+                    pom = readMavenPom file: "pom.xml";
+                    // Find built artifact under target folder
+					echo "${pom.packaging}"
+                    filesByGlob = findFiles(glob: "target/*.war");
+                    // Print some info from the artifact found
+                    echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
+                    // Extract the path from the File found
+                    artifactPath = filesByGlob[0].path;
+                    // Assign to a boolean response verifying If the artifact name exists
+                    artifactExists = fileExists artifactPath;
+                    if(artifactExists) {
+                        echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: war, version ${pom.version}";
+                        nexusArtifactUploader(
+                            nexusVersion: NEXUS_VERSION,
+                            protocol: NEXUS_PROTOCOL,
+                            nexusUrl: NEXUS_URL,
+                            groupId: pom.groupId,
+                            version: pom.version,
+                            repository: NEXUS_REPOSITORY,
+                            credentialsId: NEXUS_CREDENTIAL_ID,
+                            artifacts: [
+                                // Artifact generated such as .jar, .ear and .war files.
+                               [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: artifactPath,
+                                type: 'war'],
+                                // Lets upload the pom.xml file for additional information for Transitive dependencies
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: "pom.xml",
+                                type: "pom"]
+                            ]
+                        );
+                    } else {
+                        error "*** File: ${artifactPath}, could not be found";
+                    }
+                }
+              }
+            }
+        }
+        
+	    stage('deploy') {	
+            steps {
+					echo "Jenkins Build Number ${env.VERSION}"
+                    echo "POM Version ${POM_VERSION}";
+                    echo "Next release ${params.next_release}";
+                    echo "Major_minor ${major_minor}";
+                    
+					sh "ssh root@192.168.3.46 mkdir /home/smart2go/011_cloud/Script/deployments/wars/EEv${env.VERSION}" 
+					sh "scp /var/jenkins_home/workspace/EmailEngine_Staging/target/Smart2GoEmailEngine.war root@192.168.3.46:/home/smart2go/011_cloud/Script/deployments/wars/EEv${env.VERSION}"
+					sh """
+					ssh root@192.168.3.46 <<EOF
+					cd /home/smart2go/011_cloud/Script/ 
+					bash docker_upgrade_EE.sh S2G_Test EEv${env.VERSION}
+					bash docker_upgrade_EE.sh S2G_Auto_Test EEv${env.VERSION}
+					bash docker_upgrade_EE.sh orc_Test EEv${env.VERSION}
+					
+					if [ ! ${major_minor} = ${params.next_release} ]; then
+					    bash docker_upgrade_EE.sh mob_Test EEv${env.VERSION}
+					fi
+					
+					cd deployments/wars
+					rm -rf  EEv${env.VERSION}
+					EOF
+					"""
+					   .stripIndent()
+            }
+        }
+   
+    }
+}
